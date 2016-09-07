@@ -1,7 +1,14 @@
 use std::{fmt, mem, usize};
 use std::iter::IntoIterator;
 use std::ops;
+use std::cmp::max;
 use std::marker::PhantomData;
+
+/// Detailed configuration to use to create a new Slab
+pub struct Builder {
+    initial_capacity: usize,
+    max_capacity: usize,
+}
 
 /// A preallocated chunk of memory for storing objects of the same type.
 pub struct Slab<T, I = usize> {
@@ -14,6 +21,9 @@ pub struct Slab<T, I = usize> {
     // Offset of the next available slot in the slab. Set to the slab's
     // capacity when the slab is full.
     next: usize,
+
+    // Maximum capacity
+    max: usize,
 
     _marker: PhantomData<I>,
 }
@@ -61,9 +71,13 @@ macro_rules! some {
 }
 
 impl<T, I> Slab<T, I> {
-    /// Returns an empty `Slab` with the requested capacity
-    pub fn with_capacity(capacity: usize) -> Slab<T, I> {
-        let entries = (1..capacity + 1)
+    fn new(initial_capacity: usize, max_capacity: usize) -> Slab<T, I> {
+        let len = if initial_capacity == 0 { 32 }
+                  else { initial_capacity.checked_next_power_of_two().expect("capacity too large") };
+
+        let max = max(len, max_capacity).checked_next_power_of_two().expect("capacity too large");
+
+        let entries = (1..len + 1)
             .map(Slot::Empty)
             .collect::<Vec<_>>();
 
@@ -71,8 +85,14 @@ impl<T, I> Slab<T, I> {
             entries: entries,
             next: 0,
             len: 0,
+            max: max,
             _marker: PhantomData,
         }
+    }
+
+    /// Returns an empty `Slab` with the requested capacity
+    pub fn with_capacity(capacity: usize) -> Slab<T, I> {
+        Slab::new(capacity, capacity)
     }
 
     /// Returns the number of values stored by the `Slab`
@@ -80,9 +100,9 @@ impl<T, I> Slab<T, I> {
         self.len
     }
 
-    /// Returns the total capacity of the `Slab`
+    /// Returns the max capacity of the `Slab`
     pub fn capacity(&self) -> usize {
-        self.entries.len()
+        self.max
     }
 
     /// Returns true if the `Slab` is storing no values
@@ -92,7 +112,7 @@ impl<T, I> Slab<T, I> {
 
     /// Returns the number of available slots remaining in the `Slab`
     pub fn available(&self) -> usize {
-        self.entries.len() - self.len
+        self.max - self.len
     }
 
     /// Returns true if the `Slab` has available slots
@@ -162,7 +182,7 @@ impl<T, I: Into<usize> + From<usize>> Slab<T, I> {
     pub fn vacant_entry(&mut self) -> Option<VacantEntry<T, I>> {
         let idx = self.next;
 
-        if idx >= self.entries.len() {
+        if idx >= self.max {
             return None;
         }
 
@@ -222,22 +242,41 @@ impl<T, I: Into<usize> + From<usize>> Slab<T, I> {
         self.len = 0;
     }
 
-    /// Reserves the minimum capacity for exactly `additional` more elements to
-    /// be inserted in the given `Slab`. Does nothing if the capacity is
-    /// already sufficient.
+    /// Increases the maximum capacity to reserve space for at least `additional`
+    /// more elements to be inserted in the given 'Slab'. Does nothing if the
+    /// maximum capacity is already sufficient.
+    ///
+    /// This method is called `reserve_exact` for compatibility with an earlier
+    /// version of this crate. The current version may reserve space for more
+    /// elements than requested.
     pub fn reserve_exact(&mut self, additional: usize) {
-        let prev_len = self.entries.len();
+        if self.available() > additional {
+            return;
+        }
 
-        // Ensure `entries_num` isn't too big
-        assert!(additional < usize::MAX - prev_len, "capacity too large");
+        let extra_needed = additional - self.available();
+
+        assert!(extra_needed < usize::MAX - self.max, "capacity too large");
+        self.max = (self.max + extra_needed).checked_next_power_of_two().expect("capacity too large");
+        println!("new max = {}", self.max);
+    }
+
+    fn grow(&mut self) {
+        let prev_len = self.entries.len();
+        let next_len = (prev_len + 1).next_power_of_two();
 
         let prev_len_next = prev_len + 1;
-        self.entries.extend((prev_len_next..(prev_len_next + additional)).map(Slot::Empty));
+        self.entries.extend((prev_len_next..(next_len + 1)).map(Slot::Empty));
 
-        debug_assert_eq!(self.entries.len(), prev_len + additional);
+        debug_assert_eq!(self.entries.len(), next_len);
     }
 
     fn insert_at(&mut self, idx: usize, value: T) -> I {
+        println!("insert_at: {}", idx);
+        if idx >= self.entries.len() {
+            self.grow();
+        }
+
         self.next = match self.entries[idx] {
             Slot::Empty(next) => next,
             Slot::Filled(_) => panic!("Index already contains value"),
@@ -475,6 +514,33 @@ impl<'a, T, I> Iterator for IterMut<'a, T, I> {
     }
 }
 
+/*
+ *
+ * ===== Builder =====
+ *
+ */
+
+impl Builder {
+    /// Create a new Builder with maximum Slab capacity
+    pub fn new(capacity: usize) -> Builder {
+        Builder {
+            initial_capacity: capacity,
+            max_capacity: capacity,
+        }
+    }
+
+    /// Set the initial Slab capacity
+    pub fn initial_capacity(mut self, capacity: usize) -> Builder {
+        self.initial_capacity = capacity;
+        self
+    }
+
+    pub fn build<T, I>(self) -> Slab<T, I> {
+        Slab::new(self.initial_capacity, self.max_capacity)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,9 +597,9 @@ mod tests {
 
     #[test]
     fn test_repeated_insertion() {
-        let mut slab = Slab::<usize, usize>::with_capacity(10);
+        let mut slab = Slab::<usize, usize>::with_capacity(16);
 
-        for i in 0..10 {
+        for i in 0..16 {
             let idx = slab.insert(i + 10).ok().expect("Failed to insert");
             assert_eq!(slab[idx], i + 10);
         }
@@ -793,18 +859,18 @@ mod tests {
 
         assert!(slab.insert(0).is_err());
 
-        slab.reserve_exact(3);
+        slab.reserve_exact(4);
 
         let vals: Vec<u32> = slab.iter().map(|r| *r).collect();
         assert_eq!(vals, vec![0, 1, 2, 3]);
 
-        for i in 0..3 {
+        for i in 0..4 {
             slab.insert(i).unwrap();
         }
         assert!(slab.insert(0).is_err());
 
         let vals: Vec<u32> = slab.iter().map(|r| *r).collect();
-        assert_eq!(vals, vec![0, 1, 2, 3, 0, 1, 2]);
+        assert_eq!(vals, vec![0, 1, 2, 3, 0, 1, 2, 3]);
     }
 
     #[test]
@@ -833,5 +899,31 @@ mod tests {
 
         let vals: Vec<u32> = slab.iter().map(|r| *r).collect();
         assert_eq!(vals, vec![]);
+    }
+
+    #[test]
+    fn test_builder_low_initial_capacity() {
+        let mut slab: Slab<u32, usize> = Builder::new(3).initial_capacity(1).build();
+        assert_eq!(slab.capacity(), 4);
+
+        for i in 0..4 {
+            slab.insert(i).unwrap();
+        }
+        assert!(slab.insert(0).is_err());
+
+        let vals: Vec<u32> = slab.iter().map(|r| *r).collect();
+        assert_eq!(vals, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_builder_high_initial_capacity() {
+        let slab: Slab<u32, usize> = Builder::new(1).initial_capacity(3).build();
+        assert_eq!(slab.capacity(), 4);
+    }
+
+    #[test]
+    fn test_builder_zero_initial_capacity() {
+        let slab: Slab<u32, usize> = Builder::new(1).initial_capacity(0).build();
+        assert_eq!(slab.capacity(), 32);
     }
 }
