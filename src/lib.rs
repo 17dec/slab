@@ -258,7 +258,6 @@ impl<T, I: Into<usize> + From<usize>> Slab<T, I> {
 
         assert!(extra_needed < usize::MAX - self.max, "capacity too large");
         self.max = (self.max + extra_needed).checked_next_power_of_two().expect("capacity too large");
-        println!("new max = {}", self.max);
     }
 
     fn grow(&mut self) {
@@ -272,7 +271,6 @@ impl<T, I: Into<usize> + From<usize>> Slab<T, I> {
     }
 
     fn insert_at(&mut self, idx: usize, value: T) -> I {
-        println!("insert_at: {}", idx);
         if idx >= self.entries.len() {
             self.grow();
         }
